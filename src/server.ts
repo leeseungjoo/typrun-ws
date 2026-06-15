@@ -22,8 +22,8 @@ const SESSION_COOKIE = process.env.SESSION_COOKIE || 'typrun_session';
 // 상대가 들어오면 6초 카운트 후 시작(수정요청3 2026-06-15). 단어 풀 로드/마음의 준비 시간도 확보.
 const COUNTDOWN_MS = 6000;
 const HEARTBEAT_MS = 30000;
-// 한 명이 먼저 끝내면 나머지를 이 시간까지 기다렸다가 결과 확정(미제출자는 이탈 처리).
-const MATCH_GRACE_MS = Number(process.env.MATCH_GRACE_MS || 12000);
+// 한 명이 먼저 끝내면 상대에게 opponent:finished 로 즉시 마무리를 알린다. 이 시간은 그래도 응답 없을 때의 폴백.
+const MATCH_GRACE_MS = Number(process.env.MATCH_GRACE_MS || 6000);
 
 // ── 인증: 쿠키 JWT → userSeq (typrain-server lib/userSession.ts 와 정렬) ──
 function parseCookies(header: string | undefined): Record<string, string> {
@@ -141,6 +141,26 @@ function finalizeMatch(matchId: string): void {
   rooms.finish(matchId);
 }
 
+// ── 카운트다운 중 상대 이탈 → 매치 취소(남은 인원에게 알림) ──────────
+function cancelMatch(matchId: string, leaverSeq: number): void {
+  const room = rooms.get(matchId);
+  if (!room) return;
+  for (const p of room.players) {
+    if (p.userSeq === leaverSeq) continue;
+    const cl = clients.get(p.userSeq);
+    if (cl) {
+      send(cl.ws, { t: 'match:cancelled', matchId, reason: 'opponent_left' });
+      cl.matchId = undefined;
+    }
+  }
+  const timer = graceTimers.get(matchId);
+  if (timer) {
+    clearTimeout(timer);
+    graceTimers.delete(matchId);
+  }
+  rooms.finish(matchId); // 룸 삭제 → 예약된 match:start setTimeout 은 rooms.get null 로 무시됨
+}
+
 // ── 메시지 처리 ─────────────────────────────────────────────────────
 function handle(c: Client, msg: ClientMsg): void {
   switch (msg.t) {
@@ -251,9 +271,13 @@ function handle(c: Client, msg: ClientMsg): void {
       });
       if (rooms.allFinished(c.matchId)) {
         finalizeMatch(c.matchId);
-      } else if (!graceTimers.has(c.matchId)) {
-        const mid = c.matchId; // 한 명 먼저 끝 → grace 후 강제 확정(나머지는 이탈 처리)
-        graceTimers.set(mid, setTimeout(() => finalizeMatch(mid), MATCH_GRACE_MS));
+      } else {
+        // 한 명 먼저 끝 → 상대에게 즉시 마무리 신호(바로 끝나게) + grace 폴백.
+        relayToOpponents(c, { t: 'opponent:finished', userSeq: c.userSeq });
+        if (!graceTimers.has(c.matchId)) {
+          const mid = c.matchId;
+          graceTimers.set(mid, setTimeout(() => finalizeMatch(mid), MATCH_GRACE_MS));
+        }
       }
       break;
     }
@@ -323,8 +347,13 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       if (mid) {
         const room = rooms.get(mid);
         if (room && !room.finalized) {
-          rooms.recordFinish(mid, userSeq, { score: 0, maxCombo: 0, correct: 0, miss: 0, abandoned: true });
-          if (rooms.allFinished(mid)) finalizeMatch(mid);
+          if (room.status === 'countdown') {
+            // 시작 전(카운트다운) 이탈 → 매치 취소: 남은 인원에게 알리고 룸 폐기(혼자 시작 방지).
+            cancelMatch(mid, userSeq);
+          } else {
+            rooms.recordFinish(mid, userSeq, { score: 0, maxCombo: 0, correct: 0, miss: 0, abandoned: true });
+            if (rooms.allFinished(mid)) finalizeMatch(mid);
+          }
         }
       }
       // 재연결로 교체된 새 클라이언트는 지우지 않음(이 연결의 client 일 때만).

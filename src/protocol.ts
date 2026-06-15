@@ -43,8 +43,10 @@ export type ServerMsg =
   | { t: 'clear:reject'; spawnIndex: number } // 선착 패배 — 낙관적 클리어 롤백하라(경쟁형: 단어 1개 선착)
   | { t: 'opponent:typing'; userSeq: number; spawnIndex: number; len: number } // 실시간 상대 입력 진행(소규모 방이라 OK)
   | { t: 'opponent:state'; userSeq: number; score: number; combo: number; hp: number }
+  | { t: 'opponent:finished'; userSeq: number } // 상대가 먼저 끝남 → 즉시 마무리 신호(클라가 자기 게임도 종료)
   | { t: 'item:used'; userSeq: number; effect: string; targetSeq: number } // 공격=상대(자동조준), 버프=본인
   | { t: 'match:over'; matchId: string; results: MatchResult[]; isRanked: boolean }
+  | { t: 'match:cancelled'; matchId: string; reason: 'opponent_left' } // 카운트다운 중 상대 이탈 → 매치 취소
   | { t: 'error'; code: string; message: string };
 
 export function needForMode(mode: Mode): number {

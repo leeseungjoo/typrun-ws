@@ -52,8 +52,8 @@ export class QueueManager {
   }
 }
 
-// 승부 인정 최소 점수 — 1등 점수가 이 미만이면 무효판(전원 draw). 클라 화면에도 동일 표기(기획 2026-06-15).
-export const WIN_THRESHOLD = 500;
+// 승부 인정 최소 점수 — 1등 점수가 이 미만이면 무효판(전원 draw). 클라 화면에도 동일 표기(수정요청4 2026-06-15: 200).
+export const WIN_THRESHOLD = 200;
 
 // ── 룸/매치 FSM (인메모리) ──────────────────────────────────────────
 export type MatchStatus = 'countdown' | 'playing' | 'done';
