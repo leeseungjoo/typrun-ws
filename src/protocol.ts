@@ -10,6 +10,14 @@ export interface PlayerInfo {
   joinOrder: number; // 0,1,2
 }
 
+// 단어폭주(word_burst) 추가 단어 — 공유필드 양쪽 동일 적용용(id/word seq/위치/속도)
+export interface BurstAdd {
+  id: number;
+  wordSeq: number;
+  x: number;
+  speed: number;
+}
+
 export interface MatchResult {
   userSeq: number;
   rankInMatch: number;
@@ -29,6 +37,7 @@ export type ClientMsg =
   | { t: 'state:update'; matchId: string; score: number; combo: number; hp: number } // 상대 미러뷰 동기화(스로틀)
   | { t: 'item:used'; matchId: string; effect: string } // 공격형 아이템 1개를 상대에게(2인 자동조준)
   | { t: 'effect:sync'; matchId: string; effect: string } // 공유필드: 낙하속도/정지 효과를 양쪽 동기화(거북이/멈춤/가속)
+  | { t: 'field:mutate'; matchId: string; op: 'bomb' | 'snipe' | 'burst'; ids?: number[]; adds?: BurstAdd[] } // 공유필드: 단어 추가/제거 아이템 양쪽 미러
   | { t: 'match:finish'; matchId: string; clientScore: number; maxCombo: number; correct: number; miss: number }
   | { t: 'match:resync'; matchId: string };
 
@@ -47,6 +56,7 @@ export type ServerMsg =
   | { t: 'opponent:finished'; userSeq: number } // 상대가 먼저 끝남 → 즉시 마무리 신호(클라가 자기 게임도 종료)
   | { t: 'item:used'; userSeq: number; effect: string; targetSeq: number } // 공격=상대(자동조준), 버프=본인
   | { t: 'opponent:effect'; effect: string } // 상대가 발동한 동기화 효과(거북이/멈춤/가속) — 내 필드에도 적용
+  | { t: 'opponent:mutate'; op: 'bomb' | 'snipe' | 'burst'; ids?: number[]; adds?: BurstAdd[] } // 상대가 단어 추가/제거 — 내 필드도 동일 변경
   | { t: 'match:over'; matchId: string; results: MatchResult[]; isRanked: boolean }
   | { t: 'match:cancelled'; matchId: string; reason: 'opponent_left' } // 카운트다운 중 상대 이탈 → 매치 취소
   | { t: 'error'; code: string; message: string };

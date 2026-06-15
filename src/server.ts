@@ -263,6 +263,16 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
     }
 
+    case 'field:mutate': {
+      // 공유필드: 단어 추가/제거 아이템(폭탄·저격·단어폭주)을 상대 필드에도 동일 적용.
+      if (!c.matchId) break;
+      if (msg.op !== 'bomb' && msg.op !== 'snipe' && msg.op !== 'burst') break;
+      const ids = Array.isArray(msg.ids) ? msg.ids.filter((n) => Number.isFinite(n)).slice(0, 50) : undefined;
+      const adds = Array.isArray(msg.adds) ? msg.adds.slice(0, 16) : undefined;
+      relayToOpponents(c, { t: 'opponent:mutate', op: msg.op, ids, adds });
+      break;
+    }
+
     case 'match:finish': {
       if (!c.matchId || !rooms.get(c.matchId)) break;
       const clamp = (n: unknown): number => {
