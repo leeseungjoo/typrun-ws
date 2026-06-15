@@ -256,6 +256,13 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
     }
 
+    case 'effect:sync': {
+      // 공유필드: 낙하속도/정지 효과(거북이/멈춤/가속)를 상대 필드에도 동일 적용 → 두 화면 동기화.
+      if (!c.matchId) break;
+      relayToOpponents(c, { t: 'opponent:effect', effect: msg.effect });
+      break;
+    }
+
     case 'match:finish': {
       if (!c.matchId || !rooms.get(c.matchId)) break;
       const clamp = (n: unknown): number => {
