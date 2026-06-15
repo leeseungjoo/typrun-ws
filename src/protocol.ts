@@ -26,7 +26,8 @@ export type ClientMsg =
   | { t: 'word:clear'; matchId: string; spawnIndex: number; typed: string; comboAfter: number; elapsedMs: number; cid?: number }
   | { t: 'word:typing'; matchId: string; spawnIndex: number; len: number } // 입력 진행(실시간 상대 표시용)
   | { t: 'word:miss'; matchId: string; spawnIndex: number; hp: number }
-  | { t: 'item:used'; matchId: string; effect: string }
+  | { t: 'state:update'; matchId: string; score: number; combo: number; hp: number } // 상대 미러뷰 동기화(스로틀)
+  | { t: 'item:used'; matchId: string; effect: string } // 공격형 아이템 1개를 상대에게(2인 자동조준)
   | { t: 'match:finish'; matchId: string; clientScore: number; maxCombo: number; correct: number; miss: number }
   | { t: 'match:resync'; matchId: string };
 

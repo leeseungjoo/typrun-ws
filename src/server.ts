@@ -19,7 +19,8 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 const SESSION_COOKIE = process.env.SESSION_COOKIE || 'typrun_session';
-const COUNTDOWN_MS = 3000;
+// 상대가 들어오면 10초 카운트 후 시작(기획 2026-06-15). 단어 풀 로드/마음의 준비 시간도 확보.
+const COUNTDOWN_MS = 10000;
 const HEARTBEAT_MS = 30000;
 // 한 명이 먼저 끝내면 나머지를 이 시간까지 기다렸다가 결과 확정(미제출자는 이탈 처리).
 const MATCH_GRACE_MS = Number(process.env.MATCH_GRACE_MS || 12000);
@@ -192,21 +193,16 @@ function handle(c: Client, msg: ClientMsg): void {
     }
 
     case 'word:clear': {
-      // 경쟁형 선착 권위: spawnIndex 를 먼저 친 사람만 인정(recv 순서). 패배자에겐 clear:reject 로 롤백 지시.
-      // (TODO P3b: 시간창 dueAt~deathAt·단어풀 길이 검증은 단어풀 확보 후.)
+      // 양분 모델(2026-06-15): 각자 독립 필드를 가진다(선착 경쟁 폐기). 상대에게 "내가 이 단어를 깼다"만 중계해
+      // 상대 화면의 내 미러뷰(점수/콤보/별똥별)를 갱신한다. 점수 권위 검증은 Phase 3b(서버 단어풀 확보 후).
       if (!c.matchId) break;
       const spawnIndex = Number(msg.spawnIndex);
       const comboAfter = Number(msg.comboAfter);
       if (!Number.isFinite(spawnIndex) || spawnIndex < 0 || !Number.isFinite(comboAfter)) break;
-      const idx = Math.trunc(spawnIndex);
-      if (!rooms.claimClear(c.matchId, idx, c.userSeq)) {
-        send(c.ws, { t: 'clear:reject', spawnIndex: idx }); // 이미 상대가 선착 — 롤백하라
-        break;
-      }
       relayToOpponents(c, {
         t: 'opponent:clear',
         userSeq: c.userSeq,
-        spawnIndex: idx,
+        spawnIndex: Math.trunc(spawnIndex),
         scoreDelta: 0,
         totalScore: 0,
         combo: Math.max(1, Math.min(500, Math.trunc(comboAfter))), // 악성 콤보 부풀리기 방어
@@ -216,10 +212,29 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
     }
 
-    case 'item:used':
-      // TODO(P2): 공격=자동조준(선두) 상대, 버프=본인. 현재는 상대 중계 스텁(targetSeq=0).
+    case 'state:update': {
+      // 상대 미러뷰의 점수/콤보/생명 동기화(스로틀해서 보냄). 신뢰값은 클램프만(영속 아님).
+      if (!c.matchId) break;
+      const clampN = (n: unknown, max: number): number => {
+        const v = Number(n);
+        return Number.isFinite(v) && v >= 0 ? Math.min(max, Math.trunc(v)) : 0;
+      };
+      relayToOpponents(c, {
+        t: 'opponent:state',
+        userSeq: c.userSeq,
+        score: clampN(msg.score, 10_000_000),
+        combo: clampN(msg.combo, 500),
+        hp: clampN(msg.hp, 10),
+      });
+      break;
+    }
+
+    case 'item:used': {
+      // 공격형(negative) 아이템만 클라가 전송 → 단일 상대에게 그대로 적용(2인 자동조준). 버프형은 본인 로컬 적용이라 미전송.
+      if (!c.matchId) break;
       relayToOpponents(c, { t: 'item:used', userSeq: c.userSeq, effect: msg.effect, targetSeq: 0 });
       break;
+    }
 
     case 'match:finish': {
       if (!c.matchId || !rooms.get(c.matchId)) break;

@@ -52,6 +52,9 @@ export class QueueManager {
   }
 }
 
+// 승부 인정 최소 점수 — 1등 점수가 이 미만이면 무효판(전원 draw). 클라 화면에도 동일 표기(기획 2026-06-15).
+export const WIN_THRESHOLD = 500;
+
 // ── 룸/매치 FSM (인메모리) ──────────────────────────────────────────
 export type MatchStatus = 'countdown' | 'playing' | 'done';
 
@@ -74,7 +77,6 @@ export interface MatchState {
   ready: Set<number>;
   finishes: Map<number, FinishStat>; // userSeq → 종료 통계
   finalized: boolean; // match:over 1회 보장
-  clearedBy: Map<number, number>; // spawnIndex → 선착으로 깬 userSeq(경쟁형 단어 1개 선착)
 }
 
 export class RoomManager {
@@ -93,19 +95,9 @@ export class RoomManager {
       ready: new Set<number>(),
       finishes: new Map<number, FinishStat>(),
       finalized: false,
-      clearedBy: new Map<number, number>(),
     };
     this.rooms.set(state.matchId, state);
     return state;
-  }
-
-  /** spawnIndex 선착 점유 시도 — 처음이면 true(점유 성공), 이미 있으면 false(선착 패배). */
-  claimClear(matchId: string, spawnIndex: number, userSeq: number): boolean {
-    const r = this.rooms.get(matchId);
-    if (!r || r.finalized) return false;
-    if (r.clearedBy.has(spawnIndex)) return false;
-    r.clearedBy.set(spawnIndex, userSeq);
-    return true;
   }
 
   get(matchId: string): MatchState | undefined {
@@ -137,11 +129,19 @@ export class RoomManager {
     const topCount = scored.filter((s) => s.finalScore === maxScore).length;
     const sorted = [...scored].sort((a, b) => b.finalScore - a.finalScore);
     const rankOf = new Map(sorted.map((s, i) => [s.userSeq, i + 1]));
+    // 1등 점수가 기준 미만이면 무효판 — 전원 draw(승부 불성립).
+    const decisive = maxScore >= WIN_THRESHOLD;
     return scored.map((s) => ({
       userSeq: s.userSeq,
       rankInMatch: rankOf.get(s.userSeq) ?? r.players.length,
       finalScore: s.finalScore,
-      result: s.finalScore === maxScore ? (topCount > 1 ? 'draw' : 'win') : 'loss',
+      result: !decisive
+        ? 'draw'
+        : s.finalScore === maxScore
+        ? topCount > 1
+          ? 'draw'
+          : 'win'
+        : 'loss',
     }));
   }
 
