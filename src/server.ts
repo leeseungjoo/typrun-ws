@@ -19,8 +19,8 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 const SESSION_COOKIE = process.env.SESSION_COOKIE || 'typrun_session';
-// 상대가 들어오면 10초 카운트 후 시작(기획 2026-06-15). 단어 풀 로드/마음의 준비 시간도 확보.
-const COUNTDOWN_MS = 10000;
+// 상대가 들어오면 6초 카운트 후 시작(수정요청3 2026-06-15). 단어 풀 로드/마음의 준비 시간도 확보.
+const COUNTDOWN_MS = 6000;
 const HEARTBEAT_MS = 30000;
 // 한 명이 먼저 끝내면 나머지를 이 시간까지 기다렸다가 결과 확정(미제출자는 이탈 처리).
 const MATCH_GRACE_MS = Number(process.env.MATCH_GRACE_MS || 12000);
