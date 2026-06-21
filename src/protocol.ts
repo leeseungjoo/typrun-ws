@@ -30,6 +30,10 @@ export type ClientMsg =
   | { t: 'ping'; c: number }
   | { t: 'queue:join'; categorySeq: number; mode: Mode; nickname?: string }
   | { t: 'queue:leave' }
+  // 친구 초대 대결(사설 방) — 호스트가 방 생성 → 코드 공유 → 친구가 코드로 입장. 인원 충족 시 일반 매치로 승격.
+  | { t: 'room:create'; categorySeq: number; mode: Mode; nickname?: string }
+  | { t: 'room:join'; code: string; nickname?: string }
+  | { t: 'room:leave' }
   | { t: 'match:ready'; matchId: string; cid?: number }
   | { t: 'word:clear'; matchId: string; spawnIndex: number; typed: string; comboAfter: number; elapsedMs: number; cid?: number }
   | { t: 'word:typing'; matchId: string; spawnIndex: number; len: number } // 입력 진행(실시간 상대 표시용)
@@ -47,7 +51,7 @@ export type ServerMsg =
   | { t: 'queue:status'; have: number; need: number }
   | { t: 'queue:slow' }
   | { t: 'queue:lonely'; suggest: 'retry' | '2p' }
-  | { t: 'match:found'; matchId: string; mode: Mode; matchSeed: number; matchStartTs: number; players: PlayerInfo[]; you: number }
+  | { t: 'match:found'; matchId: string; mode: Mode; categorySeq: number; matchSeed: number; matchStartTs: number; players: PlayerInfo[]; you: number }
   | { t: 'match:start'; matchId: string; serverTs: number }
   | { t: 'opponent:clear'; userSeq: number; spawnIndex: number; scoreDelta: number; totalScore: number; combo: number; isFirst: boolean; serverTs: number }
   | { t: 'clear:reject'; spawnIndex: number } // 선착 패배 — 낙관적 클리어 롤백하라(경쟁형: 단어 1개 선착)
@@ -59,6 +63,10 @@ export type ServerMsg =
   | { t: 'opponent:mutate'; op: 'bomb' | 'snipe' | 'burst'; ids?: number[]; adds?: BurstAdd[] } // 상대가 단어 추가/제거 — 내 필드도 동일 변경
   | { t: 'match:over'; matchId: string; results: MatchResult[]; isRanked: boolean }
   | { t: 'match:cancelled'; matchId: string; reason: 'opponent_left' } // 카운트다운 중 상대 이탈 → 매치 취소
+  // 친구 초대 대결 — 방 생성 응답(코드) / 입장 대기 상태 / 입장 실패.
+  | { t: 'room:created'; code: string; categorySeq: number; mode: Mode; have: number; need: number }
+  | { t: 'room:waiting'; code: string; have: number; need: number }
+  | { t: 'room:error'; reason: 'not_found' | 'full' | 'login_required' | 'bad_request'; message: string }
   | { t: 'error'; code: string; message: string };
 
 export function needForMode(mode: Mode): number {

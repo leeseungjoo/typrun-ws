@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage } from 'http';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { jwtVerify } from 'jose';
-import { QueueManager, RoomManager, CounterService } from './managers';
-import type { ClientMsg, ServerMsg, Mode } from './protocol';
+import { QueueManager, RoomManager, CounterService, PrivateRoomManager } from './managers';
+import type { ClientMsg, ServerMsg, Mode, PlayerInfo } from './protocol';
 import { needForMode } from './protocol';
 
 // ── 설정 ────────────────────────────────────────────────────────────
@@ -49,6 +49,20 @@ async function userSeqFromRequest(req: IncomingMessage): Promise<number | null> 
   }
 }
 
+// ── 게스트 식별 (비회원 친구 초대 입장용) ────────────────────────────
+// 실회원 seq 는 항상 양수(autoincrement). 게스트는 음수 seq 를 부여해 매치 파이프라인(clients/relay/결과)을
+// 그대로 재사용하면서 충돌을 막는다. 클라가 보낸 안정 토큰(?guest=)에 음수 seq 를 1:1 매핑 → 재연결해도 동일 seq 유지.
+const guestSeqByToken = new Map<string, number>();
+let nextGuestSeq = -1;
+function guestSeqFor(token: string): number {
+  let s = guestSeqByToken.get(token);
+  if (s == null) {
+    s = nextGuestSeq--;
+    guestSeqByToken.set(token, s);
+  }
+  return s;
+}
+
 // ── 연결 상태 ───────────────────────────────────────────────────────
 interface Client {
   ws: WebSocket;
@@ -61,6 +75,7 @@ interface Client {
 
 const queue = new QueueManager();
 const rooms = new RoomManager(COUNTDOWN_MS);
+const privateRooms = new PrivateRoomManager(); // 친구 초대 대결 대기방(코드 기반)
 const counter = new CounterService(queue, rooms);
 const clients = new Map<number, Client>(); // userSeq → client (단일 인스턴스 전제)
 const graceTimers = new Map<string, ReturnType<typeof setTimeout>>(); // matchId → 종료 유예 타이머
@@ -80,17 +95,8 @@ function relayToOpponents(c: Client, msg: ServerMsg): void {
   }
 }
 
-// ── 매칭 → 룸 생성 → 카운트다운 → 시작 ─────────────────────────────
-function tryMatch(categorySeq: number, mode: Mode): void {
-  const group = queue.tryMatch(categorySeq, mode);
-  if (!group) return;
-
-  const players = group.map((e, i) => ({
-    userSeq: e.userSeq,
-    nickname: e.nickname,
-    profileImage: e.profileImage,
-    joinOrder: i,
-  }));
+// ── 룸 생성 → match:found → 카운트다운 → match:start (랜덤·사설 공용) ──
+function startMatch(categorySeq: number, mode: Mode, players: PlayerInfo[]): void {
   const room = rooms.create(categorySeq, mode, players);
 
   for (const p of players) {
@@ -101,6 +107,7 @@ function tryMatch(categorySeq: number, mode: Mode): void {
       t: 'match:found',
       matchId: room.matchId,
       mode,
+      categorySeq,
       matchSeed: room.matchSeed,
       matchStartTs: room.matchStartTs,
       players,
@@ -118,6 +125,34 @@ function tryMatch(categorySeq: number, mode: Mode): void {
       if (cl) send(cl.ws, { t: 'match:start', matchId: r.matchId, serverTs: now });
     }
   }, COUNTDOWN_MS);
+}
+
+// ── 랜덤 매칭 → 룸 시작 ─────────────────────────────────────────────
+function tryMatch(categorySeq: number, mode: Mode): void {
+  const group = queue.tryMatch(categorySeq, mode);
+  if (!group) return;
+  const players: PlayerInfo[] = group.map((e, i) => ({
+    userSeq: e.userSeq,
+    nickname: e.nickname,
+    profileImage: e.profileImage,
+    joinOrder: i,
+  }));
+  startMatch(categorySeq, mode, players);
+}
+
+// ── 친구 초대 대결: 대기방 인원 충족 → 룸 시작 ──────────────────────
+function promotePrivate(code: string): void {
+  const room = privateRooms.take(code);
+  if (!room) return;
+  // 승격되는 모든 멤버는 큐에 남아있을 수 있으니 제거(이중 매칭 방지).
+  for (const m of room.members) queue.leave(m.userSeq);
+  const players: PlayerInfo[] = room.members.map((m, i) => ({
+    userSeq: m.userSeq,
+    nickname: m.nickname,
+    profileImage: m.profileImage,
+    joinOrder: i,
+  }));
+  startMatch(room.categorySeq, room.mode, players);
 }
 
 // ── 종료 집계 → match:over 브로드캐스트 (1회 보장) ──────────────────
@@ -190,6 +225,81 @@ function handle(c: Client, msg: ClientMsg): void {
     case 'queue:leave':
       queue.leave(c.userSeq);
       break;
+
+    case 'room:create': {
+      // 친구 초대 대결 방 생성 — 로그인 필요(호스트는 초대장 주인). 게스트(음수 seq)는 거절.
+      if (c.userSeq < 0) {
+        send(c.ws, { t: 'room:error', reason: 'login_required', message: '로그인이 필요합니다.' });
+        break;
+      }
+      const mode: Mode = msg.mode === '3p' ? '3p' : '2p';
+      const categorySeq = Number(msg.categorySeq);
+      if (!Number.isFinite(categorySeq) || categorySeq <= 0) {
+        send(c.ws, { t: 'room:error', reason: 'bad_request', message: '리그 정보가 올바르지 않습니다.' });
+        break;
+      }
+      const nick = typeof msg.nickname === 'string' ? msg.nickname.trim().slice(0, 20) : '';
+      if (nick) c.nickname = nick;
+      const room = privateRooms.createOrGet(c.userSeq, categorySeq, mode, {
+        userSeq: c.userSeq,
+        nickname: c.nickname,
+        profileImage: c.profileImage,
+      });
+      send(c.ws, {
+        t: 'room:created',
+        code: room.code,
+        categorySeq,
+        mode,
+        have: room.members.length,
+        need: needForMode(mode),
+      });
+      break;
+    }
+
+    case 'room:join': {
+      const code = typeof msg.code === 'string' ? msg.code.trim().toUpperCase().slice(0, 12) : '';
+      const nick = typeof msg.nickname === 'string' ? msg.nickname.trim().slice(0, 20) : '';
+      if (nick) c.nickname = nick;
+      if (!code) {
+        send(c.ws, { t: 'room:error', reason: 'not_found', message: '초대 코드가 없습니다.' });
+        break;
+      }
+      const res = privateRooms.join(code, {
+        userSeq: c.userSeq,
+        nickname: c.nickname,
+        profileImage: c.profileImage,
+      });
+      if (!res.ok) {
+        send(c.ws, {
+          t: 'room:error',
+          reason: res.reason,
+          message: res.reason === 'full' ? '방이 가득 찼습니다.' : '방을 찾을 수 없습니다(만료되었거나 닫힘).',
+        });
+        break;
+      }
+      const need = needForMode(res.room.mode);
+      if (res.ready) {
+        promotePrivate(code); // 인원 충족 → match:found 로 전환
+      } else {
+        // 아직 대기 중 — 현재 멤버 전원에게 인원 갱신.
+        for (const m of res.room.members) {
+          const cl = clients.get(m.userSeq);
+          if (cl) send(cl.ws, { t: 'room:waiting', code: res.room.code, have: res.room.members.length, need });
+        }
+      }
+      break;
+    }
+
+    case 'room:leave': {
+      // 호스트면 방 폐기(잔여 멤버 통보), 입장자면 멤버에서만 제거.
+      const closedOthers = privateRooms.removeByHost(c.userSeq);
+      for (const seq of closedOthers) {
+        const cl = clients.get(seq);
+        if (cl) send(cl.ws, { t: 'room:error', reason: 'not_found', message: '상대가 방을 닫았습니다.' });
+      }
+      privateRooms.removeMember(c.userSeq);
+      break;
+    }
 
     case 'match:ready': {
       const room = rooms.get(msg.matchId);
@@ -337,14 +447,27 @@ const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
 wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   void (async () => {
-    const userSeq = await userSeqFromRequest(req);
-    if (!userSeq) {
-      send(ws, { t: 'error', code: '401', message: '로그인이 필요합니다.' });
-      ws.close();
-      return;
+    let resolvedSeq = await userSeqFromRequest(req);
+    let nickname: string;
+    if (resolvedSeq) {
+      // TODO: nickname/profileImage 는 추후 Prisma 조회로 채움
+      nickname = `user${resolvedSeq}`;
+    } else {
+      // 비회원 게스트 — ?guest=<토큰> 가 있으면 안정 음수 seq 부여(친구 초대 입장 전용).
+      // 토큰 없으면 거절: 랜덤배틀/일반접속은 여전히 로그인 필요(기존 동작 유지).
+      const url = new URL(req.url || '/', 'http://localhost');
+      const guestToken = url.searchParams.get('guest');
+      if (!guestToken) {
+        send(ws, { t: 'error', code: '401', message: '로그인이 필요합니다.' });
+        ws.close();
+        return;
+      }
+      resolvedSeq = guestSeqFor(guestToken);
+      const n = (url.searchParams.get('n') || '').trim().slice(0, 20);
+      nickname = n || '게스트';
     }
-    // TODO: nickname/profileImage 는 추후 Prisma 조회로 채움
-    const client: Client = { ws, userSeq, nickname: `user${userSeq}`, alive: true };
+    const userSeq: number = resolvedSeq;
+    const client: Client = { ws, userSeq, nickname, alive: true };
     clients.set(userSeq, client);
 
     ws.on('pong', () => { client.alive = true; });
@@ -359,6 +482,20 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
     });
     ws.on('close', () => {
       queue.leave(userSeq);
+      // 친구 초대 대기방 정리 — 호스트 이탈 시 방 폐기(잔여 멤버 통보), 입장자 이탈 시 멤버 제거(인원 갱신).
+      const closedOthers = privateRooms.removeByHost(userSeq);
+      for (const seq of closedOthers) {
+        const cl = clients.get(seq);
+        if (cl) send(cl.ws, { t: 'room:error', reason: 'not_found', message: '상대가 나갔습니다.' });
+      }
+      const affected = privateRooms.removeMember(userSeq);
+      if (affected) {
+        const need = needForMode(affected.mode);
+        for (const m of affected.members) {
+          const cl = clients.get(m.userSeq);
+          if (cl) send(cl.ws, { t: 'room:waiting', code: affected.code, have: affected.members.length, need });
+        }
+      }
       // 진행 중 매치에서 이탈 → abandoned(score 0) 기록 후 종료 조건 확인(상대 무한대기 방지).
       const mid = client.matchId;
       if (mid) {
@@ -390,6 +527,9 @@ setInterval(() => {
     try { c.ws.ping(); } catch { /* ignore */ }
   }
 }, HEARTBEAT_MS);
+
+// 오래된 친구 초대 대기방 청소(친구가 안 들어온 채 방치된 코드 회수).
+setInterval(() => privateRooms.sweep(Date.now()), 5 * 60 * 1000);
 
 httpServer.listen(PORT, () => {
   // eslint-disable-next-line no-console

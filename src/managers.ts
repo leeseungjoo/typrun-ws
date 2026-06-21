@@ -165,6 +165,127 @@ export class RoomManager {
   }
 }
 
+// ── 친구 초대 대결: 사설 방 (인메모리, 코드로 입장) ────────────────────
+// 호스트가 방을 만들면 짧은 코드를 받고, 코드 링크로 들어온 친구(비회원 포함)와 1:1 매치로 승격된다.
+// 헷갈리는 0/O/1/I/L 제외 알파벳 — 구두로도 공유 가능.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const CODE_LEN = 6;
+const ROOM_TTL_MS = 30 * 60 * 1000; // 30분 지난 미사용 방은 청소
+
+function genCode(): string {
+  const bytes = randomBytes(CODE_LEN);
+  let out = '';
+  for (let i = 0; i < CODE_LEN; i++) out += CODE_ALPHABET[bytes[i] % CODE_ALPHABET.length];
+  return out;
+}
+
+export interface RoomMember {
+  userSeq: number;
+  nickname: string;
+  profileImage?: string | null;
+}
+
+export interface PendingRoom {
+  code: string;
+  categorySeq: number;
+  mode: Mode;
+  hostSeq: number;
+  members: RoomMember[]; // [0]=호스트
+  createdAt: number;
+}
+
+export type JoinResult =
+  | { ok: true; room: PendingRoom; ready: boolean } // ready=인원 충족(승격 가능)
+  | { ok: false; reason: 'not_found' | 'full' };
+
+export class PrivateRoomManager {
+  private byCode = new Map<string, PendingRoom>();
+  private codeByHost = new Map<number, string>(); // 호스트 재연결 멱등성(같은 호스트=같은 코드)
+
+  /** 호스트가 방 생성. 같은 호스트가 이미 대기방을 가지면 그 방을 반환(재연결 멱등). */
+  createOrGet(hostSeq: number, categorySeq: number, mode: Mode, host: RoomMember): PendingRoom {
+    const existingCode = this.codeByHost.get(hostSeq);
+    if (existingCode) {
+      const r = this.byCode.get(existingCode);
+      if (r) {
+        r.members[0] = host; // 닉네임/프로필 최신화
+        r.categorySeq = categorySeq;
+        r.mode = mode;
+        r.createdAt = Date.now();
+        return r;
+      }
+      this.codeByHost.delete(hostSeq);
+    }
+    let code = genCode();
+    while (this.byCode.has(code)) code = genCode();
+    const room: PendingRoom = { code, categorySeq, mode, hostSeq, members: [host], createdAt: Date.now() };
+    this.byCode.set(code, room);
+    this.codeByHost.set(hostSeq, code);
+    return room;
+  }
+
+  get(code: string): PendingRoom | undefined {
+    return this.byCode.get(code.toUpperCase());
+  }
+
+  /** 코드로 입장. 이미 들어온 멤버면 멱등(재연결). 인원이 차면 ready=true. */
+  join(code: string, member: RoomMember): JoinResult {
+    const r = this.byCode.get(code.toUpperCase());
+    if (!r) return { ok: false, reason: 'not_found' };
+    const need = needForMode(r.mode);
+    const already = r.members.some((m) => m.userSeq === member.userSeq);
+    if (!already) {
+      if (r.members.length >= need) return { ok: false, reason: 'full' };
+      r.members.push(member);
+    }
+    return { ok: true, room: r, ready: r.members.length >= need };
+  }
+
+  /** 승격(매치 시작) 시 대기방을 큐에서 제거하고 반환. */
+  take(code: string): PendingRoom | undefined {
+    const r = this.byCode.get(code.toUpperCase());
+    if (r) this.removeByCode(r.code);
+    return r;
+  }
+
+  removeByCode(code: string): void {
+    const r = this.byCode.get(code);
+    if (!r) return;
+    this.byCode.delete(r.code);
+    if (this.codeByHost.get(r.hostSeq) === r.code) this.codeByHost.delete(r.hostSeq);
+  }
+
+  /** 호스트 이탈 → 그 호스트의 대기방 폐기. 폐기된 방의 (호스트 외) 잔여 멤버 seq 목록을 반환. */
+  removeByHost(hostSeq: number): number[] {
+    const code = this.codeByHost.get(hostSeq);
+    if (!code) return [];
+    const r = this.byCode.get(code);
+    const others = r ? r.members.filter((m) => m.userSeq !== hostSeq).map((m) => m.userSeq) : [];
+    this.removeByCode(code);
+    return others;
+  }
+
+  /** 입장자(비호스트) 이탈 → 대기방에서만 제거(호스트는 계속 대기). 대기방이 영향받았으면 그 방을 반환. */
+  removeMember(userSeq: number): PendingRoom | null {
+    for (const r of this.byCode.values()) {
+      if (r.hostSeq === userSeq) continue; // 호스트는 removeByHost 가 처리
+      const i = r.members.findIndex((m) => m.userSeq === userSeq);
+      if (i >= 0) {
+        r.members.splice(i, 1);
+        return r;
+      }
+    }
+    return null;
+  }
+
+  /** 오래된 미사용 방 청소(주기 호출). */
+  sweep(now: number): void {
+    for (const r of [...this.byCode.values()]) {
+      if (now - r.createdAt > ROOM_TTL_MS) this.removeByCode(r.code);
+    }
+  }
+}
+
 // ── 접속자 카운터 (게임중/대기중) ───────────────────────────────────
 export class CounterService {
   constructor(
