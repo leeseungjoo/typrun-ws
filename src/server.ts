@@ -63,6 +63,9 @@ function guestSeqFor(token: string): number {
   return s;
 }
 
+// 게스트 토큰 형식 검증 — 빈/짧은(추측 가능)/거대 토큰 거절. 웹 클라는 ~20자 영숫자.
+const GUEST_TOKEN_RE = /^[A-Za-z0-9_-]{8,128}$/;
+
 // ── 연결 상태 ───────────────────────────────────────────────────────
 interface Client {
   ws: WebSocket;
@@ -71,6 +74,7 @@ interface Client {
   profileImage?: string | null;
   matchId?: string;
   alive: boolean;
+  guestToken?: string; // 게스트면 토큰 보관(끊길 때 매핑 회수해 누수 방지)
 }
 
 const queue = new QueueManager();
@@ -204,6 +208,7 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
 
     case 'queue:join': {
+      if (c.matchId && rooms.get(c.matchId)) break; // 이미 진행중 매치 → 이중 매칭 방지(다른 탭/경로 재진입)
       // 닉네임은 클라가 전달(uid 는 JWT 로 인증됨 — 닉네임은 표시용이라 위조 위험 낮음). 길이 상한.
       const nick = typeof msg.nickname === 'string' ? msg.nickname.trim().slice(0, 20) : '';
       if (nick) c.nickname = nick;
@@ -227,6 +232,7 @@ function handle(c: Client, msg: ClientMsg): void {
       break;
 
     case 'room:create': {
+      if (c.matchId && rooms.get(c.matchId)) break; // 이미 진행중 매치 → 무시(이중 매칭 방지)
       // 친구 초대 대결 방 생성 — 로그인 필요(호스트는 초대장 주인). 게스트(음수 seq)는 거절.
       if (c.userSeq < 0) {
         send(c.ws, { t: 'room:error', reason: 'login_required', message: '로그인이 필요합니다.' });
@@ -257,6 +263,7 @@ function handle(c: Client, msg: ClientMsg): void {
     }
 
     case 'room:join': {
+      if (c.matchId && rooms.get(c.matchId)) break; // 이미 진행중 매치 → 무시(이중 매칭 방지)
       const code = typeof msg.code === 'string' ? msg.code.trim().toUpperCase().slice(0, 12) : '';
       const nick = typeof msg.nickname === 'string' ? msg.nickname.trim().slice(0, 20) : '';
       if (nick) c.nickname = nick;
@@ -449,6 +456,7 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
   void (async () => {
     let resolvedSeq = await userSeqFromRequest(req);
     let nickname: string;
+    let guestToken: string | undefined;
     if (resolvedSeq) {
       // TODO: nickname/profileImage 는 추후 Prisma 조회로 채움
       nickname = `user${resolvedSeq}`;
@@ -456,18 +464,25 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       // 비회원 게스트 — ?guest=<토큰> 가 있으면 안정 음수 seq 부여(친구 초대 입장 전용).
       // 토큰 없으면 거절: 랜덤배틀/일반접속은 여전히 로그인 필요(기존 동작 유지).
       const url = new URL(req.url || '/', 'http://localhost');
-      const guestToken = url.searchParams.get('guest');
-      if (!guestToken) {
+      const tok = url.searchParams.get('guest');
+      if (!tok || !GUEST_TOKEN_RE.test(tok)) {
+        // 토큰 없음/형식 위반 → 거절(빈·짧은·거대 토큰으로 인한 추측·남용 방지).
         send(ws, { t: 'error', code: '401', message: '로그인이 필요합니다.' });
         ws.close();
         return;
       }
-      resolvedSeq = guestSeqFor(guestToken);
+      guestToken = tok;
+      resolvedSeq = guestSeqFor(tok);
       const n = (url.searchParams.get('n') || '').trim().slice(0, 20);
       nickname = n || '게스트';
     }
     const userSeq: number = resolvedSeq;
-    const client: Client = { ws, userSeq, nickname, alive: true };
+    // 같은 seq 의 이전 연결이 살아있으면(재연결/멀티탭/충돌) 조용한 이중소유 대신 명시적으로 닫는다.
+    const prev = clients.get(userSeq);
+    if (prev && prev.ws !== ws) {
+      try { prev.ws.close(); } catch { /* ignore */ }
+    }
+    const client: Client = { ws, userSeq, nickname, alive: true, guestToken };
     clients.set(userSeq, client);
 
     ws.on('pong', () => { client.alive = true; });
@@ -481,13 +496,13 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
       handle(client, msg);
     });
     ws.on('close', () => {
+      // ★ stale 가드: 재연결/교체로 이미 다른 연결이 이 seq 를 차지했으면 이 죽은 소켓은 아무 정리도 안 한다.
+      // (BattleSocket 자동재연결 시 stale close 가 방/매치를 부수면 블립 한 번에 초대링크·진행중 매치가 날아간다.)
+      if (clients.get(userSeq) !== client) return;
+
       queue.leave(userSeq);
-      // 친구 초대 대기방 정리 — 호스트 이탈 시 방 폐기(잔여 멤버 통보), 입장자 이탈 시 멤버 제거(인원 갱신).
-      const closedOthers = privateRooms.removeByHost(userSeq);
-      for (const seq of closedOthers) {
-        const cl = clients.get(seq);
-        if (cl) send(cl.ws, { t: 'room:error', reason: 'not_found', message: '상대가 나갔습니다.' });
-      }
+      // 호스트 대기방은 끊겨도 즉시 폐기하지 않음 — 블립 후 재연결 시 같은 코드 유지(명시적 room:leave·30분 TTL 로만 회수).
+      // 입장자(비호스트)만 대기방에서 제거하고 인원 갱신.
       const affected = privateRooms.removeMember(userSeq);
       if (affected) {
         const need = needForMode(affected.mode);
@@ -510,8 +525,9 @@ wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
           }
         }
       }
-      // 재연결로 교체된 새 클라이언트는 지우지 않음(이 연결의 client 일 때만).
-      if (clients.get(userSeq) === client) clients.delete(userSeq);
+      // 게스트 토큰 매핑 회수(메모리 누수 방지) — 이 live 연결이 진짜 끊긴 것이므로(재연결은 위 가드로 이미 return).
+      if (client.guestToken) guestSeqByToken.delete(client.guestToken);
+      clients.delete(userSeq); // 가드 통과 = 이 client 가 슬롯 주인.
     });
   })();
 });
